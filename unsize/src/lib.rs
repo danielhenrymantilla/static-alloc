@@ -24,16 +24,16 @@ use core::{
 
 mod impls {
     //! Safety: Provenance is always the same as self, pointer target is simply passed through.
-    use core::ptr::NonNull;
+    use core::{pin::Pin, ptr::NonNull};
     use super::CoerciblePtr;
 
     unsafe impl<'lt, T, U: ?Sized + 'lt> CoerciblePtr<U> for &'lt T {
         type Pointee = T;
         type Output = &'lt U;
-        fn as_sized_ptr(&self) -> *mut T {
-            (*self) as *const T as *mut T
+        fn into_raw(self: &'lt T) -> *mut T {
+            self as *const T as *mut T
         }
-        unsafe fn replace_ptr(self, new: *mut U) -> &'lt U {
+        unsafe fn from_raw_unsized(new: *mut U) -> &'lt U {
             unsafe { &*new }
         }
     }
@@ -42,38 +42,40 @@ mod impls {
     unsafe impl<'lt, T, U: ?Sized + 'lt> CoerciblePtr<U> for &'lt mut T {
         type Pointee = T;
         type Output = &'lt mut U;
-        fn as_sized_ptr(&self) -> *mut T {
-            (*self) as *const T as *mut T
+        fn into_raw(self: &'lt mut T) -> *mut T {
+            self
         }
-        unsafe fn replace_ptr(self, new: *mut U) -> &'lt mut U {
+        unsafe fn from_raw_unsized(new: *mut U) -> &'lt mut U {
             unsafe { &mut *new }
         }
     }
 
-    unsafe impl<Ptr, U : ?Sized, T> CoerciblePtr<U> for core::pin::Pin<Ptr>
+    unsafe impl<Ptr, U : ?Sized, T> CoerciblePtr<U> for Pin<Ptr>
     where
         Ptr: CoerciblePtr<U> + core::ops::Deref<Target=T>,
         Ptr::Output: core::ops::Deref<Target=U>,
     {
-        type Pointee = T;
-        type Output = core::pin::Pin<Ptr::Output>;
-        fn as_sized_ptr(&self) -> *mut Self::Pointee {
-            self.as_ref().get_ref() as *const Self::Pointee as *mut _
+        type Pointee = <Ptr as CoerciblePtr<U>>::Pointee;
+        type Output = Pin<Ptr::Output>;
+        fn into_raw(self: Pin<Ptr>) -> *mut Self::Pointee {
+            let inner: Ptr = unsafe { Pin::into_inner_unchecked(self) };
+            <Ptr as CoerciblePtr<U>>::into_raw(inner)
         }
-        unsafe fn replace_ptr(self, new: *mut U) -> Self::Output {
-            let inner = core::pin::Pin::into_inner_unchecked(self);
-            let new = inner.replace_ptr(new);
-            core::pin::Pin::new_unchecked(new)
+        unsafe fn from_raw_unsized(new: *mut U) -> Self::Output {
+            let inner = <Ptr as CoerciblePtr<U>>::from_raw_unsized(new);
+            unsafe {
+                Pin::new_unchecked(inner)
+            }
         }
     }
 
     unsafe impl<T, U: ?Sized> CoerciblePtr<U> for core::ptr::NonNull<T> {
         type Pointee = T;
         type Output = NonNull<U>;
-        fn as_sized_ptr(&self) -> *mut T {
+        fn into_raw(self) -> *mut T {
             self.as_ptr()
         }
-        unsafe fn replace_ptr(self, new: *mut U) -> NonNull<U> {
+        unsafe fn from_raw_unsized(new: *mut U) -> NonNull<U> {
             // Safety:
             NonNull::new_unchecked(new)
         }
@@ -309,12 +311,12 @@ pub unsafe trait CoerciblePtr<U: ?Sized>: Sized {
     /// The output type when unsizing the pointee to `U`.
     type Output;
     /// Get the raw inner pointer.
-    fn as_sized_ptr(&self) -> *mut Self::Pointee;
+    fn into_raw(self) -> *mut Self::Pointee;
     /// Replace the container inner pointer with an unsized version.
     /// # Safety
     /// The caller guarantees that the replacement is the same pointer, just a fat pointer variant
     /// with a correct tag.
-    unsafe fn replace_ptr(self, _: *mut U) -> Self::Output;
+    unsafe fn from_raw_unsized(_: *mut U) -> Self::Output;
 }
 
 /// An extension trait using `CoerciblePtr` for a safe interface.
@@ -329,9 +331,9 @@ pub trait CoerceUnsize<U: ?Sized>: CoerciblePtr<U> {
         F : FnOnce(*const Self::Pointee) -> *const U,
     {
         unsafe {
-            let ptr = self.as_sized_ptr();
+            let ptr = self.into_raw();
             let new_ptr = unsize_with(ptr, with.coerce);
-            self.replace_ptr(new_ptr)
+            Self::from_raw_unsized(new_ptr)
         }
     }
 }
